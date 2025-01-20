@@ -1,0 +1,18 @@
+# Server configuration
+server:
+  port: 8080  # The port number the application's HTTP server will listen on
+
+# Database connection settings
+database:
+  host: "localhost"     # Database server hostname (local PostgreSQL server)
+  port: 5432           # Default PostgreSQL port number
+  user: "postgres"     # Database user name
+  password: "password" # Database user password
+  dbname: "localportfoliomanager"  # Name of the database to connect to
+  sslmode: "disable"   # SSL mode for database connection (disable, require, verify-ca, verify-full)
+
+# Web scraper settings
+scraper:
+  max_pages: 10        # Maximum number of pages to scrape per ticker (each page contains 25 records)
+  timeout: 30          # Maximum time in seconds to wait for page operations
+  delay: 1            # Delay in seconds between page loads to avoid overwhelming the server

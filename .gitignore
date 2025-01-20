@@ -1,0 +1,25 @@
+# Binaries and object files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Output directory
+output/
+logs/
+temp_builds/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and config files (optional, remove if you want to include config.yaml)
+# config.yaml
+
+# Go specific
+vendor/ 
