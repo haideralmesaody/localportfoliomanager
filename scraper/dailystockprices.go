@@ -115,17 +115,17 @@ func (s *Scraper) GetStockData(ticker string) ([]StockData, error) {
 	// Set up date range and trigger search
 	err = chromedp.Run(s.ctx,
 		chromedp.Evaluate(`
-			(() => {
-				const dateInput = document.querySelector("#fromDate");
-				dateInput.value = "01/01/2020";
-				const event = new Event('change', { bubbles: true });
-				dateInput.dispatchEvent(event);
+                (() => {
+                    const dateInput = document.querySelector("#fromDate");
+                    dateInput.value = "01/01/2020"; 
+                    const event = new Event('change', { bubbles: true });
+                    dateInput.dispatchEvent(event);
 
-				const searchButton = document.querySelector("#command > div.filterbox > div.button-all > input[type=button]");
-				searchButton.click();
-				return true;
-			})()
-		`, nil),
+                    const searchButton = document.querySelector("#command > div.filterbox > div.button-all > input[type=button]");
+                    searchButton.click();
+                    return true;
+                })()
+            `, nil),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set date range: %v", err)
@@ -147,24 +147,24 @@ func (s *Scraper) GetStockData(ticker string) ([]StockData, error) {
 		var pageData []StockData
 		err = chromedp.Run(s.ctx,
 			chromedp.Evaluate(`
-				(() => {
-					const table = document.getElementById('dispTable');
-					const rows = table.querySelectorAll('tbody tr');
-					return Array.from(rows).map(row => {
-						const cells = row.querySelectorAll('td');
-						return {
-							Date: cells[9].textContent.trim(),
-							OpenPrice: cells[7].textContent.trim(),
-							HighPrice: cells[6].textContent.trim(),
-							LowPrice: cells[5].textContent.trim(),
-							ClosePrice: cells[8].textContent.trim(),
-							Volume: cells[1].textContent.trim(),
-							TotalShares: cells[2].textContent.trim(),
-							NumTrades: cells[0].textContent.trim()
-						};
-					});
-				})()
-			`, &pageData),
+                (() => {
+                    const table = document.getElementById('dispTable');
+                    const rows = table.querySelectorAll('tbody tr');
+                    return Array.from(rows).map(row => {
+                        const cells = row.querySelectorAll('td');
+                        return {
+                            Date: cells[9].textContent.trim(),
+                            OpenPrice: cells[7].textContent.trim(),
+                            HighPrice: cells[6].textContent.trim(),
+                            LowPrice: cells[5].textContent.trim(),
+                            ClosePrice: cells[8].textContent.trim(),
+                            Volume: cells[1].textContent.trim(),
+                            TotalShares: cells[2].textContent.trim(),
+                            NumTrades: cells[0].textContent.trim()
+                        };
+                    });
+                })()
+            `, &pageData),
 		)
 		if err != nil {
 			fmt.Printf("Error extracting data from page %d: %v\n", currentPage, err)
@@ -219,13 +219,13 @@ func (s *Scraper) GetStockData(ticker string) ([]StockData, error) {
 		fmt.Printf("Navigating to page %d...\n", nextPage)
 		err = chromedp.Run(s.ctx,
 			chromedp.Evaluate(fmt.Sprintf(`
-				(() => {
-					doAjax('companyperformancehistoryfilter.html',
-						'fromDate=01/01/2020&d-6716032-p=%d&toDate=23/12/2024&companyCode=%s',
-						'ajxDspId');
-					return true;
-				})()
-			`, nextPage, ticker), nil),
+                (() => {
+                    doAjax('companyperformancehistoryfilter.html',
+                           'fromDate=01/01/2020&d-6716032-p=%d&toDate=23/12/2024&companyCode=%s',
+                           'ajxDspId');
+                    return true;
+                })()
+            `, nextPage, ticker), nil),
 		)
 		if err != nil {
 			fmt.Printf("Failed to navigate to page %d: %v\n", nextPage, err)

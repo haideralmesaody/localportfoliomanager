@@ -1,4 +1,10 @@
-# Binaries and object files
+# Output and temporary files
+output/
+logs/
+temp_builds/
+*.log
+
+# Go specific
 *.exe
 *.exe~
 *.dll
@@ -6,20 +12,17 @@
 *.dylib
 *.test
 *.out
+go.work
 
-# Output directory
-output/
-logs/
-temp_builds/
-
-# IDE specific files
+# IDE specific
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Environment and config files (optional, remove if you want to include config.yaml)
-# config.yaml
+# OS specific
+.DS_Store
+Thumbs.db
 
-# Go specific
-vendor/ 
+# Config files with sensitive data (optional, if you want to exclude it)
+# config.yaml 
