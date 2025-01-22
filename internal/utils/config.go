@@ -6,14 +6,19 @@ import (
 	"github.com/spf13/viper"
 )
 
+// ServerConfig holds server configuration
+type ServerConfig struct {
+	Port string `mapstructure:"port"`
+}
+
 // DatabaseConfig holds database configuration
 type DatabaseConfig struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	DBName   string
-	SSLMode  string
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	DBName   string `mapstructure:"dbname"`
+	SSLMode  string `mapstructure:"sslmode"`
 	DSN      string
 }
 
@@ -27,6 +32,7 @@ type ScraperConfig struct {
 
 // Config holds all configuration
 type Config struct {
+	Server   ServerConfig   `mapstructure:"server"`
 	Database DatabaseConfig `mapstructure:"database"`
 	Scraper  ScraperConfig  `mapstructure:"scraper"`
 }

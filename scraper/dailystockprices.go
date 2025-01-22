@@ -793,3 +793,55 @@ func (s *Scraper) RecalculateAllPriceChanges() error {
 	s.logger.Info("Successfully recalculated all price changes")
 	return nil
 }
+
+// ScrapeStockPrices scrapes current stock prices for all tickers
+func (s *Scraper) ScrapeStockPrices() error {
+	s.logger.Info("Starting stock price scraping...")
+	defer s.logger.Info("Completed stock price scraping")
+
+	// Get list of tickers from database
+	tickers, err := s.GetTickersFromDB()
+	if err != nil {
+		s.logger.Error("Failed to get tickers from database: %v", err)
+		return fmt.Errorf("failed to get tickers: %v", err)
+	}
+
+	if len(tickers) == 0 {
+		s.logger.Error("No tickers found in database")
+		return fmt.Errorf("no tickers found")
+	}
+
+	s.logger.Info("Found %d tickers in database", len(tickers))
+
+	// Process each ticker
+	for _, ticker := range tickers {
+		s.logger.Info("Processing ticker: %s", ticker)
+
+		stockDataList, err := s.GetStockData(ticker)
+		if err != nil {
+			s.logger.Error("Failed to get stock data for %s: %v", ticker, err)
+			continue
+		}
+
+		// Calculate price changes
+		stockDataList = s.CalculatePriceChanges(stockDataList)
+
+		// Save to database
+		err = s.SaveStockData(ticker, stockDataList)
+		if err != nil {
+			s.logger.Error("Failed to save data for %s: %v", ticker, err)
+			continue
+		}
+
+		s.logger.Info("Successfully processed ticker: %s", ticker)
+	}
+
+	// After all tickers are processed, recalculate changes
+	if err := s.RecalculateAllPriceChanges(); err != nil {
+		s.logger.Error("Failed to recalculate price changes: %v", err)
+		return fmt.Errorf("failed to recalculate price changes: %v", err)
+	}
+
+	s.logger.Info("Scraping completed successfully")
+	return nil
+}
