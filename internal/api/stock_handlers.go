@@ -2,6 +2,7 @@ package api
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -110,7 +111,12 @@ func (s *Server) GetStocks(w http.ResponseWriter, r *http.Request) {
 				LAG(date, 1) OVER (
 					PARTITION BY ticker 
 					ORDER BY date DESC
-				) as prev_date
+				) as prev_date,
+				ARRAY_AGG(close_price) OVER (
+					PARTITION BY ticker 
+					ORDER BY date DESC
+					ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+				) as sparkline_prices
 			FROM daily_stock_prices
 			ORDER BY ticker, date DESC
 		)
@@ -125,6 +131,7 @@ func (s *Server) GetStocks(w http.ResponseWriter, r *http.Request) {
 					ROUND(((lp.current_price - lp.prev_price) / lp.prev_price) * 100, 2)
 				ELSE 0 
 			END as change_percentage,
+			lp.sparkline_prices,
 			COUNT(*) OVER() as total_count
 		FROM LatestPrices lp
 		ORDER BY lp.ticker
@@ -150,6 +157,7 @@ func (s *Server) GetStocks(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var stock StockResponse
 		var currentDate, prevDate sql.NullTime
+		var sparklinePrices []float64
 		if err := rows.Scan(
 			&stock.Ticker,
 			&stock.LastPrice,
@@ -157,6 +165,7 @@ func (s *Server) GetStocks(w http.ResponseWriter, r *http.Request) {
 			&prevDate,
 			&stock.Change,
 			&stock.ChangePercentage,
+			&sparklinePrices,
 			&total,
 		); err != nil {
 			s.logger.Error("Failed to scan stock row: %v", err)
@@ -173,6 +182,7 @@ func (s *Server) GetStocks(w http.ResponseWriter, r *http.Request) {
 			stock.ChangePercentage,
 		)
 
+		stock.SparklinePrices = sparklinePrices
 		stocks = append(stocks, stock)
 	}
 
@@ -188,6 +198,11 @@ func (s *Server) GetStocks(w http.ResponseWriter, r *http.Request) {
 	response := StocksListResponse{
 		Stocks: stocks,
 		Total:  total,
+	}
+
+	// Ensure that stocksList is always a slice, even if empty:
+	if stocks == nil {
+		stocks = []StockResponse{} // or proper slice type
 	}
 
 	// Log before sending response
@@ -295,122 +310,99 @@ func (s *Server) GetStockPrices(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	ticker := vars["ticker"]
 
-	// Get query parameters
-	fromDateStr := r.URL.Query().Get("from")
-	toDateStr := r.URL.Query().Get("to")
-	interval := r.URL.Query().Get("interval")
-
-	// Default to daily interval if not specified
-	if interval == "" {
-		interval = "daily"
-	}
-
-	// Parse dates
-	var fromDate, toDate time.Time
-	var err error
-
-	if fromDateStr != "" {
-		fromDate, err = time.Parse("2006-01-02", fromDateStr)
-		if err != nil {
-			s.respondWithError(w, http.StatusBadRequest, "Invalid from date format")
-			return
-		}
-	}
-
-	if toDateStr != "" {
-		toDate, err = time.Parse("2006-01-02", toDateStr)
-		if err != nil {
-			s.respondWithError(w, http.StatusBadRequest, "Invalid to date format")
-			return
-		}
-	} else {
-		toDate = time.Now()
-	}
-
-	// Add date validation
-	if toDate.After(time.Now()) {
-		toDate = time.Now()
-	}
-
-	// Ensure single day queries work
-	if !fromDate.IsZero() && fromDate.Equal(toDate) {
-		toDate = toDate.Add(24 * time.Hour)
-	}
-
-	// Build query with proper change calculation
 	query := `
-		WITH prices AS (
-			SELECT 
-				date,
-				open_price as open,
-				high_price as high,
-				low_price as low,
-				close_price as close,
-				qty_of_shares_traded as volume,
-				LAG(close_price) OVER (ORDER BY date DESC) as prev_close
-			FROM daily_stock_prices
-			WHERE ticker = $1
-			AND date >= COALESCE($2, date - INTERVAL '1 year')
-			AND date <= $3
-		)
 		SELECT 
-			date, 
-			open, 
-			high, 
-			low, 
-			close, 
-			volume,
-			COALESCE(close - prev_close, 0) as change,
-			CASE 
-				WHEN prev_close > 0 THEN ROUND(((close - prev_close) / prev_close) * 100, 2)
-				ELSE 0 
-			END as change_percentage
-		FROM prices
+			ticker,
+			to_char(date, 'YYYY-MM-DD') as date,
+			open_price,
+			high_price,
+			low_price,
+			close_price,
+			qty_of_shares_traded as shares_traded,
+			value_of_shares_traded as value_traded,
+			num_trades,
+			change,
+			change_percentage
+		FROM daily_stock_prices
+		WHERE ticker = $1
 		ORDER BY date DESC
 	`
 
-	// Execute query with proper date handling
-	var queryArgs []interface{}
-	queryArgs = append(queryArgs, ticker)
-	if !fromDate.IsZero() {
-		queryArgs = append(queryArgs, fromDate)
-	} else {
-		queryArgs = append(queryArgs, nil)
-	}
-	queryArgs = append(queryArgs, toDate)
-
-	rows, err := s.db.Query(query, queryArgs...)
+	rows, err := s.db.Query(query, ticker)
 	if err != nil {
-		s.logger.Error("Failed to query stock prices: %v", err)
+		s.logger.Error("Failed to fetch stock prices: %v", err)
 		s.respondWithError(w, http.StatusInternalServerError, "Failed to fetch stock prices")
 		return
 	}
 	defer rows.Close()
 
-	var prices []StockPriceData
+	var prices []map[string]interface{}
 	for rows.Next() {
-		var price StockPriceData
-		if err := rows.Scan(
-			&price.Date,
-			&price.Open,
-			&price.High,
-			&price.Low,
-			&price.Close,
-			&price.Volume,
-			&price.Change,
-			&price.ChangePercentage,
-		); err != nil {
+		var (
+			ticker        string
+			date          string
+			openPrice     float64
+			highPrice     float64
+			lowPrice      float64
+			closePrice    float64
+			sharesTraded  int64
+			valueTraded   float64
+			numTrades     int
+			change        float64
+			changePercent float64
+		)
+
+		err := rows.Scan(
+			&ticker,
+			&date,
+			&openPrice,
+			&highPrice,
+			&lowPrice,
+			&closePrice,
+			&sharesTraded,
+			&valueTraded,
+			&numTrades,
+			&change,
+			&changePercent,
+		)
+		if err != nil {
 			s.logger.Error("Failed to scan price row: %v", err)
-			s.respondWithError(w, http.StatusInternalServerError, "Failed to process price data")
-			return
+			continue
 		}
-		prices = append(prices, price)
+
+		prices = append(prices, map[string]interface{}{
+			"ticker":            ticker,
+			"date":              date,
+			"open_price":        openPrice,
+			"high_price":        highPrice,
+			"low_price":         lowPrice,
+			"close_price":       closePrice,
+			"shares_traded":     sharesTraded,
+			"value_traded":      valueTraded,
+			"num_trades":        numTrades,
+			"change":            change,
+			"change_percentage": changePercent,
+		})
 	}
 
-	response := StockPricesResponse{
-		Ticker:   ticker,
-		Interval: interval,
-		Prices:   prices,
+	if err = rows.Err(); err != nil {
+		s.logger.Error("Error iterating price rows: %v", err)
+		s.respondWithError(w, http.StatusInternalServerError, "Failed to process price data")
+		return
+	}
+
+	// Get company name
+	var companyName string
+	err = s.db.QueryRow("SELECT company_name FROM tickers WHERE ticker = $1", ticker).Scan(&companyName)
+	if err != nil {
+		s.logger.Error("Failed to fetch company name: %v", err)
+		companyName = ticker // fallback to ticker if company name not found
+	}
+
+	response := map[string]interface{}{
+		"ticker":       ticker,
+		"company_name": companyName,
+		"prices":       prices,
 	}
 
 	s.respondWithJSON(w, http.StatusOK, response)
@@ -433,4 +425,351 @@ func isTradeDay(date time.Time) bool {
 	}
 
 	return !holidays[date.Format("2006-01-02")]
+}
+
+// GetLatestStockPrices returns the latest record by date for each ticker.
+func (s *Server) GetLatestStockPrices(w http.ResponseWriter, r *http.Request) {
+	query := `
+		WITH LatestPrices AS (
+			SELECT 
+				ticker,
+				to_char(date, 'YYYY-MM-DD') as date,
+				open_price,
+				high_price,
+				low_price,
+				close_price,
+				qty_of_shares_traded as shares_traded,
+				value_of_shares_traded as value_traded,
+				num_trades,
+				change,
+				change_percentage
+			FROM daily_stock_prices dsp1
+			WHERE date = (
+				SELECT MAX(date)
+				FROM daily_stock_prices dsp2
+				WHERE dsp2.ticker = dsp1.ticker
+			)
+		)
+		SELECT * FROM LatestPrices
+		ORDER BY ticker
+	`
+
+	rows, err := s.db.Query(query)
+	if err != nil {
+		s.logger.Error("Failed to fetch stock prices: %v", err)
+		s.respondWithError(w, http.StatusInternalServerError, "Failed to fetch stock prices")
+		return
+	}
+	defer rows.Close()
+
+	// Initialize as empty slice instead of nil
+	results := make([]map[string]interface{}, 0)
+
+	for rows.Next() {
+		var (
+			ticker        string
+			date          string
+			openPrice     float64
+			highPrice     float64
+			lowPrice      float64
+			closePrice    float64
+			sharesTraded  int64
+			valueTraded   int64
+			numTrades     int
+			change        float64
+			changePercent float64
+		)
+
+		if err := rows.Scan(
+			&ticker,
+			&date,
+			&openPrice,
+			&highPrice,
+			&lowPrice,
+			&closePrice,
+			&sharesTraded,
+			&valueTraded,
+			&numTrades,
+			&change,
+			&changePercent,
+		); err != nil {
+			s.logger.Error("Failed to scan row: %v", err)
+			continue
+		}
+
+		results = append(results, map[string]interface{}{
+			"ticker":            ticker,
+			"date":              date,
+			"open_price":        openPrice,
+			"high_price":        highPrice,
+			"low_price":         lowPrice,
+			"close_price":       closePrice,
+			"shares_traded":     sharesTraded,
+			"value_traded":      valueTraded,
+			"num_trades":        numTrades,
+			"change":            change,
+			"change_percentage": changePercent,
+		})
+	}
+
+	s.logger.Debug("Successfully fetched %d stock prices", len(results))
+	s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"stocks": results,
+		"total":  len(results),
+	})
+}
+
+// GetStockDetails returns detailed information for a specific stock
+func (s *Server) GetStockDetails(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	ticker := vars["ticker"]
+
+	s.logger.Debug("GetStockDetails called for ticker: %s", ticker)
+
+	// First get the company name
+	var companyName string
+	err := s.db.QueryRow(`
+		SELECT company_name 
+		FROM tickers 
+		WHERE ticker = $1
+	`, ticker).Scan(&companyName)
+
+	if err == sql.ErrNoRows {
+		s.logger.Error("Stock not found: %s", ticker)
+		s.respondWithError(w, http.StatusNotFound, fmt.Sprintf("Stock not found: %s", ticker))
+		return
+	}
+	if err != nil {
+		s.logger.Error("Failed to fetch company name: %v", err)
+		s.respondWithError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	s.logger.Debug("Found company name: %s for ticker: %s", companyName, ticker)
+
+	// Then get the historical price data with proper change calculations
+	query := `
+		WITH daily_changes AS (
+			SELECT 
+				d.ticker,
+				d.date,
+				d.open_price,
+				d.high_price,
+				d.low_price,
+				d.close_price,
+				d.qty_of_shares_traded,
+				d.value_of_shares_traded,
+				d.num_trades,
+				COALESCE(d.close_price - LAG(d.close_price) OVER (
+					PARTITION BY d.ticker 
+					ORDER BY d.date
+				), 0) as price_change,
+				CASE 
+					WHEN LAG(d.close_price) OVER (
+						PARTITION BY d.ticker 
+						ORDER BY d.date
+					) > 0 THEN 
+						((d.close_price - LAG(d.close_price) OVER (
+							PARTITION BY d.ticker 
+							ORDER BY d.date
+						)) / LAG(d.close_price) OVER (
+							PARTITION BY d.ticker 
+							ORDER BY d.date
+						)) * 100
+					ELSE 0 
+				END as change_percentage
+			FROM daily_stock_prices d
+			WHERE d.ticker = $1
+		)
+		SELECT 
+			ticker,
+			to_char(date, 'YYYY-MM-DD') as date,
+			open_price,
+			high_price,
+			low_price,
+			close_price,
+			qty_of_shares_traded,
+			value_of_shares_traded,
+			num_trades,
+			price_change as change,
+			change_percentage
+		FROM daily_changes
+		ORDER BY date DESC
+	`
+
+	rows, err := s.db.Query(query, ticker)
+	if err != nil {
+		s.logger.Error("Failed to fetch stock data: %v", err)
+		s.respondWithError(w, http.StatusInternalServerError, "Failed to fetch stock data")
+		return
+	}
+	defer rows.Close()
+
+	var prices []map[string]interface{}
+	for rows.Next() {
+		var p struct {
+			Ticker        string
+			Date          string
+			OpenPrice     float64
+			HighPrice     float64
+			LowPrice      float64
+			ClosePrice    float64
+			SharesTraded  int64
+			ValueTraded   float64
+			NumTrades     int
+			Change        float64
+			ChangePercent float64
+		}
+
+		err := rows.Scan(
+			&p.Ticker, &p.Date, &p.OpenPrice, &p.HighPrice, &p.LowPrice,
+			&p.ClosePrice, &p.SharesTraded, &p.ValueTraded, &p.NumTrades,
+			&p.Change, &p.ChangePercent,
+		)
+		if err != nil {
+			s.logger.Error("Error scanning row: %v", err)
+			continue
+		}
+
+		prices = append(prices, map[string]interface{}{
+			"ticker":            p.Ticker,
+			"date":              p.Date,
+			"open_price":        p.OpenPrice,
+			"high_price":        p.HighPrice,
+			"low_price":         p.LowPrice,
+			"close_price":       p.ClosePrice,
+			"shares_traded":     p.SharesTraded,
+			"value_traded":      p.ValueTraded,
+			"num_trades":        p.NumTrades,
+			"change":            p.Change,
+			"change_percentage": p.ChangePercent,
+		})
+	}
+
+	s.logger.Debug("Found %d price records for %s", len(prices), ticker)
+
+	response := map[string]interface{}{
+		"ticker":       ticker,
+		"company_name": companyName,
+		"prices":       prices,
+	}
+
+	s.respondWithJSON(w, http.StatusOK, response)
+}
+
+// GetStockSparkline returns the last 10 days of closing prices for a ticker
+func (s *Server) GetStockSparkline(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	ticker := vars["ticker"]
+
+	query := `
+		WITH recent_prices AS (
+			SELECT 
+				close_price,
+				date,
+				ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) as rn
+			FROM daily_stock_prices
+			WHERE ticker = $1
+		)
+		SELECT 
+			close_price,
+			to_char(date, 'YYYY-MM-DD') as date
+		FROM recent_prices
+		WHERE rn <= 10
+		ORDER BY date ASC
+	`
+
+	rows, err := s.db.Query(query, ticker)
+	if err != nil {
+		s.logger.Error("Failed to fetch sparkline data: %v", err)
+		s.respondWithError(w, http.StatusInternalServerError, "Failed to fetch sparkline data")
+		return
+	}
+	defer rows.Close()
+
+	var prices []float64
+	var dates []string
+	for rows.Next() {
+		var price float64
+		var date string
+		if err := rows.Scan(&price, &date); err != nil {
+			s.logger.Error("Failed to scan sparkline row: %v", err)
+			s.respondWithError(w, http.StatusInternalServerError, "Failed to process sparkline data")
+			return
+		}
+		prices = append(prices, price)
+		dates = append(dates, date)
+	}
+
+	if len(prices) == 0 {
+		s.logger.Debug("No sparkline data found for ticker: %s", ticker)
+		prices = []float64{0} // Provide at least one point
+		dates = []string{time.Now().Format("2006-01-02")}
+	}
+
+	s.logger.Debug("Sparkline data for %s: prices=%v, dates=%v", ticker, prices, dates)
+
+	response := map[string]interface{}{
+		"ticker": ticker,
+		"prices": prices,
+		"dates":  dates,
+	}
+
+	s.respondWithJSON(w, http.StatusOK, response)
+}
+
+// GetStockChartData returns data formatted for Echarts
+func (s *Server) GetStockChartData(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	ticker := vars["ticker"]
+
+	query := `
+		SELECT 
+			to_char(date, 'YYYY-MM-DD') as date,
+			open_price,
+			close_price,
+			low_price,
+			high_price,
+			qty_of_shares_traded
+		FROM daily_stock_prices
+		WHERE ticker = $1
+		ORDER BY date ASC
+	`
+
+	rows, err := s.db.Query(query, ticker)
+	if err != nil {
+		s.logger.Error("Failed to fetch chart data: %v", err)
+		s.respondWithError(w, http.StatusInternalServerError, "Failed to fetch chart data")
+		return
+	}
+	defer rows.Close()
+
+	var dates []string
+	var volumes []int64
+	var candleData [][]float64
+
+	for rows.Next() {
+		var date string
+		var open, close, low, high float64
+		var volume int64
+
+		err := rows.Scan(&date, &open, &close, &low, &high, &volume)
+		if err != nil {
+			s.logger.Error("Failed to scan row: %v", err)
+			continue
+		}
+
+		dates = append(dates, date)
+		volumes = append(volumes, volume)
+		candleData = append(candleData, []float64{open, close, low, high})
+	}
+
+	response := map[string]interface{}{
+		"ticker":     ticker,
+		"dates":      dates,
+		"volumes":    volumes,
+		"candleData": candleData,
+	}
+
+	s.respondWithJSON(w, http.StatusOK, response)
 }

@@ -13,236 +13,173 @@ import (
 
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	_ "github.com/lib/pq" // Add this line - PostgreSQL driver
 )
 
 // StockData represents the structure of our scraped data
 type StockData struct {
-	Date        string
-	OpenPrice   string
-	HighPrice   string
-	LowPrice    string
-	ClosePrice  string
-	Volume      string
-	TotalShares string
-	NumTrades   string
-	Change      float64
-	ChangePerc  float64
+	Date            string
+	OpenPrice       string
+	HighPrice       string
+	LowPrice        string
+	ClosePrice      string
+	Volume          string
+	TotalShares     string
+	NumTrades       string
+	Change          float64
+	ChangePerc      float64
+	SparklinePrices []float64
+	SparklineDates  []string
 }
 
 type Scraper struct {
-	logger      *utils.Logger
+	logger      *utils.AppLogger
 	ctx         context.Context
 	cancel      context.CancelFunc
 	config      *utils.Config
 	perfTracker *utils.PerformanceTracker
+	db          *sql.DB
 }
 
-func NewScraper(logger *utils.Logger, ctx context.Context, cancel context.CancelFunc, config *utils.Config) *Scraper {
+func NewScraper(logger *utils.AppLogger, ctx context.Context, cancel context.CancelFunc, config *utils.Config) *Scraper {
+	// Initialize the database connection here
+	db, err := sql.Open("postgres", config.Database.DSN)
+	if err != nil {
+		fmt.Println("Error connecting to database:", err)
+	}
+
+	// Create context with options and suppress CDP logging
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("log-level", "3"),                  // Increase log level
+		chromedp.Flag("headless", false),                 // Changed to false to disable headless mode
+		chromedp.Flag("enable-logging", false),           // Disable CDP logging
+		chromedp.Flag("silent-debugger", true),           // Silence debugger
+		chromedp.Flag("suppress-cookie-errors", true),    // Suppress cookie errors
+		chromedp.Flag("no-sandbox", true),                // Add no-sandbox flag
+		chromedp.Flag("disable-setuid-sandbox", true),    // Disable setuid sandbox
+		chromedp.Flag("ignore-certificate-errors", true), // Ignore cert errors
+		chromedp.Flag("window-size", "1920,1080"),        // Set a larger window size
+	)
+
+	// Create allocator context with options
+	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
+
+	// Create new context with custom logger that ignores cookie errors
+	ctx, cancel = chromedp.NewContext(allocCtx,
+		chromedp.WithLogf(func(format string, args ...interface{}) {
+			// Only log if it's not a cookie error
+			if !strings.Contains(strings.ToLower(fmt.Sprintf(format, args...)), "cookie") {
+				logger.Debug(format, args...)
+			}
+		}),
+	)
+
 	return &Scraper{
 		logger:      logger,
 		ctx:         ctx,
 		cancel:      cancel,
 		config:      config,
 		perfTracker: utils.NewPerformanceTracker(),
+		db:          db,
 	}
 }
 
 func (s *Scraper) GetStockData(ticker string) ([]StockData, error) {
-	// Add debug logging for config values
-	s.logger.Debug("Scraper config: MaxPages=%d, Timeout=%d, Delay=%d",
-		s.config.Scraper.MaxPages,
-		s.config.Scraper.Timeout,
-		s.config.Scraper.Delay)
+	s.logger.Info("Starting data collection for ticker: %s", ticker)
 
-	// Try to load existing data
-	existingData, err := s.loadExistingData(ticker)
+	// Get latest date from database with better logging
+	latestDate, err := s.getLatestDate(ticker)
 	if err != nil {
-		s.logger.Debug("Error loading existing data: %v", err)
-		// Continue with full scrape if there's an error
+		s.logger.Error("Error checking latest date: %v", err)
+		return nil, err
 	}
-
-	// Disable image loading before navigation
-	err = chromedp.Run(s.ctx,
-		network.Enable(),
-		emulation.SetCPUThrottlingRate(1),
-		network.SetExtraHTTPHeaders(map[string]interface{}{
-			"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		}),
-		network.SetBlockedURLS([]string{
-			"*.png",
-			"*.jpg",
-			"*.jpeg",
-			"*.gif",
-			"*.webp",
-			"*.svg",
-			"*.ico",
-		}),
-	)
-	if err != nil {
-		s.logger.Debug("Failed to set image blocking: %v", err)
-		// Continue anyway as this is not critical
-	}
-
-	url := fmt.Sprintf("http://www.isx-iq.net/isxportal/portal/companyprofilecontainer.html?currLanguage=en&companyCode=%s%%20&activeTab=0", ticker)
-	fmt.Printf("Starting data extraction for ticker: %s\n", ticker)
-
-	// Add dialog handler before navigation
-	chromedp.ListenTarget(s.ctx, func(ev interface{}) {
-		if ev, ok := ev.(*page.EventJavascriptDialogOpening); ok {
-			s.logger.Debug("Dialog detected: %s", ev.Message)
-			go func() {
-				if err := chromedp.Run(s.ctx,
-					page.HandleJavaScriptDialog(true),
-				); err != nil {
-					s.logger.Debug("Failed to handle dialog: %v", err)
-				}
-			}()
-		}
-	})
-
-	// Navigate to the page
-	err = chromedp.Run(s.ctx,
-		chromedp.Navigate(url),
-		chromedp.WaitReady("body"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to navigate: %v", err)
-	}
-
-	// Set up date range and trigger search
-	err = chromedp.Run(s.ctx,
-		chromedp.Evaluate(`
-                (() => {
-                    const dateInput = document.querySelector("#fromDate");
-                    dateInput.value = "01/01/2020"; 
-                    const event = new Event('change', { bubbles: true });
-                    dateInput.dispatchEvent(event);
-
-                    const searchButton = document.querySelector("#command > div.filterbox > div.button-all > input[type=button]");
-                    searchButton.click();
-                    return true;
-                })()
-            `, nil),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to set date range: %v", err)
-	}
-
-	// Wait for table to load
-	time.Sleep(2 * time.Second)
+	s.logger.Info("Latest date in DB for %s: %s", ticker, latestDate)
 
 	var allStockData []StockData
 	currentPage := 1
 	maxPages := s.config.Scraper.MaxPages
 	foundOverlap := false
-	previousPageCount := 0 // Track previous page record count
-
-	fmt.Printf("Starting data extraction, will process %d pages\n", maxPages)
+	consecutiveErrors := 0
+	maxRetries := 3
 
 	for currentPage <= maxPages && !foundOverlap {
-		// Extract data from current page
-		var pageData []StockData
-		err = chromedp.Run(s.ctx,
-			chromedp.Evaluate(`
-                (() => {
-                    const table = document.getElementById('dispTable');
-                    const rows = table.querySelectorAll('tbody tr');
-                    return Array.from(rows).map(row => {
-                        const cells = row.querySelectorAll('td');
-                        return {
-                            Date: cells[9].textContent.trim(),
-                            OpenPrice: cells[7].textContent.trim(),
-                            HighPrice: cells[6].textContent.trim(),
-                            LowPrice: cells[5].textContent.trim(),
-                            ClosePrice: cells[8].textContent.trim(),
-                            Volume: cells[1].textContent.trim(),
-                            TotalShares: cells[2].textContent.trim(),
-                            NumTrades: cells[0].textContent.trim()
-                        };
-                    });
-                })()
-            `, &pageData),
-		)
-		if err != nil {
-			fmt.Printf("Error extracting data from page %d: %v\n", currentPage, err)
-			return nil, fmt.Errorf("failed to extract data from page %d: %v", currentPage, err)
+		s.logger.Debug("Scraping page %d for ticker %s", currentPage, ticker)
+
+		// Add delay between requests
+		if currentPage > 1 {
+			time.Sleep(3 * time.Second)
 		}
 
-		// Check if we've reached the end of data
-		if len(pageData) == 0 {
-			s.logger.Debug("No more data found on page %d, stopping extraction", currentPage)
+		pageData, err := s.scrapePageData(currentPage, ticker)
+		if err != nil {
+			consecutiveErrors++
+			s.logger.Error("Error on page %d for %s: %v", currentPage, ticker, err)
+
+			if consecutiveErrors >= maxRetries {
+				s.logger.Error("Max retries reached for ticker %s", ticker)
+				break
+			}
+
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		consecutiveErrors = 0
+
+		if pageData == nil || len(pageData) == 0 {
+			s.logger.Debug("No more data found for ticker %s", ticker)
 			break
 		}
 
-		// Check if we got fewer records than the previous page (last page usually has fewer records)
-		if previousPageCount > 0 && len(pageData) < previousPageCount {
-			s.logger.Debug("Found last page with %d records (previous had %d)", len(pageData), previousPageCount)
+		// Log the dates we're comparing
+		if len(pageData) > 0 {
+			s.logger.Info("First scraped record date: %s, Latest DB date: %s",
+				pageData[0].Date, latestDate)
 		}
-		previousPageCount = len(pageData)
 
-		fmt.Printf("Successfully extracted %d records from page %d\n", len(pageData), currentPage)
+		// Process data and check for overlap with improved logging
+		for _, record := range pageData {
+			s.logger.Debug("Comparing dates - Record: %s, Latest DB: %s", record.Date, latestDate)
 
-		if len(existingData) > 0 {
-			foundOverlap, newPageData := s.findOverlap(existingData, pageData)
-			if foundOverlap {
-				s.logger.Debug("Found overlap with existing data on page %d", currentPage)
-				pageData = newPageData
-				if len(pageData) == 0 {
-					s.logger.Info("No new data to add, stopping extraction")
-					return nil, nil
-				}
+			// Parse dates for proper comparison
+			recordDate, err := time.Parse("02/01/2006", record.Date)
+			if err != nil {
+				s.logger.Error("Failed to parse record date %s: %v", record.Date, err)
+				continue
 			}
-		}
 
-		allStockData = append(allStockData, pageData...)
+			dbDate, err := time.Parse("2006-01-02", latestDate)
+			if err != nil {
+				s.logger.Error("Failed to parse DB date %s: %v", latestDate, err)
+				continue
+			}
+
+			// Compare dates properly
+			if !recordDate.After(dbDate) {
+				foundOverlap = true
+				s.logger.Info("Found overlap - Record date: %s not after DB date: %s",
+					recordDate.Format("02/01/2006"), dbDate.Format("02/01/2006"))
+				break
+			}
+
+			s.logger.Debug("Adding new record for date: %s", record.Date)
+			allStockData = append(allStockData, record)
+		}
 
 		if foundOverlap {
-			s.logger.Info("Found overlap with existing data, stopping extraction")
 			break
 		}
 
-		// Check if we've reached the end of data
-		if len(pageData) < 25 { // Assuming 25 is the standard page size
-			s.logger.Debug("Reached last page (incomplete page), stopping extraction")
-			break
-		}
-
-		if currentPage >= maxPages {
-			break
-		}
-
-		// Navigate to next page
-		nextPage := currentPage + 1
-		fmt.Printf("Navigating to page %d...\n", nextPage)
-		err = chromedp.Run(s.ctx,
-			chromedp.Evaluate(fmt.Sprintf(`
-                (() => {
-                    doAjax('companyperformancehistoryfilter.html',
-                           'fromDate=01/01/2020&d-6716032-p=%d&toDate=23/12/2024&companyCode=%s',
-                           'ajxDspId');
-                    return true;
-                })()
-            `, nextPage, ticker), nil),
-		)
-		if err != nil {
-			fmt.Printf("Failed to navigate to page %d: %v\n", nextPage, err)
-			break
-		}
-
-		time.Sleep(time.Duration(s.config.Scraper.Delay) * time.Second)
 		currentPage++
 	}
 
-	// Append existing data if we have any
-	if len(existingData) > 0 {
-		allStockData = append(allStockData, existingData...)
+	s.logger.Info("Collected %d new records for ticker %s", len(allStockData), ticker)
+	if len(allStockData) > 0 {
+		s.logger.Info("New records date range: %s to %s",
+			allStockData[len(allStockData)-1].Date,
+			allStockData[0].Date)
 	}
-
-	// Calculate changes for all data
-	allStockData = s.CalculatePriceChanges(allStockData)
 
 	return allStockData, nil
 }
@@ -413,7 +350,7 @@ func (s *Scraper) refreshBrowser() error {
 }
 
 // Add this function before processTickerList
-func processSingleTicker(s *Scraper, logger *utils.Logger, ticker string) error {
+func processSingleTicker(s *Scraper, logger *utils.AppLogger, ticker string) error {
 	logger.Info("Processing ticker: %s", ticker)
 
 	// Get stock data
@@ -435,7 +372,7 @@ func processSingleTicker(s *Scraper, logger *utils.Logger, ticker string) error 
 }
 
 // Update processTickerList in main.go to handle browser refresh
-func processTickerList(s *Scraper, logger *utils.Logger, tickers []string) error {
+func processTickerList(s *Scraper, logger *utils.AppLogger, tickers []string) error {
 	totalTickers := len(tickers)
 	logger.Info("Starting to process %d tickers", totalTickers)
 
@@ -482,7 +419,10 @@ func processTickerList(s *Scraper, logger *utils.Logger, tickers []string) error
 
 // Change from calculatePriceChanges to CalculatePriceChanges
 func (s *Scraper) CalculatePriceChanges(data []StockData) []StockData {
+	s.logger.Debug("Starting price change calculations for %d records", len(data))
+
 	if len(data) < 2 {
+		s.logger.Debug("Not enough data for change calculations (need at least 2 records)")
 		return data
 	}
 
@@ -490,21 +430,34 @@ func (s *Scraper) CalculatePriceChanges(data []StockData) []StockData {
 	for i := 0; i < len(data)-1; i++ {
 		currentClose, err := strconv.ParseFloat(data[i].ClosePrice, 64)
 		if err != nil {
-			s.logger.Debug("Error parsing current close price: %v", err)
+			s.logger.Error("Error parsing current close price for date %s: %v", data[i].Date, err)
 			continue
 		}
 
 		previousClose, err := strconv.ParseFloat(data[i+1].ClosePrice, 64)
 		if err != nil {
-			s.logger.Debug("Error parsing previous close price: %v", err)
+			s.logger.Error("Error parsing previous close price for date %s: %v", data[i+1].Date, err)
 			continue
 		}
 
-		// Calculate change and change percentage
+		// Calculate change (current - previous)
 		data[i].Change = currentClose - previousClose
+
+		// Calculate change percentage ((current - previous) / previous) * 100
 		if previousClose != 0 {
 			data[i].ChangePerc = (data[i].Change / previousClose) * 100
 		}
+
+		s.logger.Debug("Date: %s, Current: %.3f, Previous: %.3f, Change: %.3f, Change%%: %.2f%%",
+			data[i].Date, currentClose, previousClose, data[i].Change, data[i].ChangePerc)
+	}
+
+	// Handle the last (oldest) record
+	if len(data) > 0 {
+		lastIdx := len(data) - 1
+		data[lastIdx].Change = 0
+		data[lastIdx].ChangePerc = 0
+		s.logger.Debug("Set change to 0 for oldest record date: %s", data[lastIdx].Date)
 	}
 
 	return data
@@ -512,15 +465,7 @@ func (s *Scraper) CalculatePriceChanges(data []StockData) []StockData {
 
 // Update loadExistingData to get last 25 records
 func (s *Scraper) loadExistingData(ticker string) ([]StockData, error) {
-	// Create database connection
-	db, err := sql.Open("postgres", s.config.Database.DSN)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
-	// Get last 25 records for proper overlap detection
-	rows, err := db.Query(`
+	rows, err := s.db.Query(`
 		SELECT 
 			TO_CHAR(date, 'DD/MM/YYYY') as formatted_date,
 			open_price,
@@ -531,11 +476,31 @@ func (s *Scraper) loadExistingData(ticker string) ([]StockData, error) {
 			value_of_shares_traded,
 			num_trades,
 			change,
-			change_percentage
+			change_percentage,
+			(
+				SELECT array_agg(close_price ORDER BY date)
+				FROM (
+					SELECT close_price, date 
+					FROM daily_stock_prices 
+					WHERE ticker = $1 
+					ORDER BY date DESC 
+					LIMIT 30
+				) sub
+			) as sparkline_prices,
+			(
+				SELECT array_agg(TO_CHAR(date, 'DD/MM/YYYY') ORDER BY date)
+				FROM (
+					SELECT date 
+					FROM daily_stock_prices 
+					WHERE ticker = $1 
+					ORDER BY date DESC 
+					LIMIT 30
+				) sub
+			) as sparkline_dates
 		FROM daily_stock_prices 
 		WHERE ticker = $1 
 		ORDER BY date DESC
-		LIMIT 25`, ticker) // Changed to 25 records
+		LIMIT 25`, ticker)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query existing data: %w", err)
 	}
@@ -558,6 +523,8 @@ func (s *Scraper) loadExistingData(ticker string) ([]StockData, error) {
 			&numTrades,
 			&record.Change,
 			&record.ChangePerc,
+			&record.SparklinePrices,
+			&record.SparklineDates,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
@@ -612,35 +579,46 @@ func (s *Scraper) findOverlap(existingData []StockData, newData []StockData) (bo
 	return foundOverlap, nonOverlappedData
 }
 
-// Add SaveStockData method
-func (s *Scraper) SaveStockData(ticker string, data []StockData) error {
-	s.logger.Info("Saving stock data for %s to the database", ticker)
+// deleteLastThreeRecords deletes the last 3 records for a given ticker.
+// Note: PostgreSQL does not allow ORDER BY in a DELETE statement,
+// so we use a subquery with ctid.
+func (s *Scraper) deleteLastThreeRecords(ticker string) error {
+	query := `
+		DELETE FROM daily_stock_prices
+		WHERE ctid IN (
+			SELECT ctid
+			FROM daily_stock_prices
+			WHERE ticker = $1
+			ORDER BY date DESC
+			LIMIT 3
+		)
+	`
+	_, err := s.db.Exec(query, ticker)
+	if err != nil {
+		return fmt.Errorf("failed to delete records: %w", err)
+	}
+	return nil
+}
 
+// ValidateAndSaveStockData validates and saves new/updated stock data to the database.
+// This method also calculates price changes.
+func (s *Scraper) ValidateAndSaveStockData(ticker string, data []StockData) error {
 	// Calculate changes before saving
 	data = s.CalculatePriceChanges(data)
 
-	// Create database connection
-	db, err := sql.Open("postgres", s.config.Database.DSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
 	// Begin transaction
-	tx, err := db.Begin()
+	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback if we don't commit
+	defer tx.Rollback() // Rollback if not committed
 
-	// Prepare the insert statement
 	stmt, err := tx.Prepare(`
 		INSERT INTO daily_stock_prices (
 			date, ticker, open_price, high_price, low_price, close_price,
 			qty_of_shares_traded, value_of_shares_traded, num_trades, change, change_percentage
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT (date, ticker) 
-		DO UPDATE SET
+		ON CONFLICT (date, ticker) DO UPDATE SET
 			open_price = EXCLUDED.open_price,
 			high_price = EXCLUDED.high_price,
 			low_price = EXCLUDED.low_price,
@@ -657,16 +635,13 @@ func (s *Scraper) SaveStockData(ticker string, data []StockData) error {
 	}
 	defer stmt.Close()
 
-	// Insert each record
 	for _, record := range data {
-		// Parse date
 		parsedDate, err := time.Parse("02/01/2006", record.Date)
 		if err != nil {
 			s.logger.Debug("Failed to parse date %s: %v", record.Date, err)
 			continue
 		}
 
-		// Parse numeric values
 		openPrice := parseFloat(record.OpenPrice)
 		highPrice := parseFloat(record.HighPrice)
 		lowPrice := parseFloat(record.LowPrice)
@@ -693,7 +668,6 @@ func (s *Scraper) SaveStockData(ticker string, data []StockData) error {
 		}
 	}
 
-	// Commit transaction
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -777,15 +751,8 @@ func parseInt(s string) int64 {
 func (s *Scraper) RecalculateAllPriceChanges() error {
 	s.logger.Info("Starting recalculation of all price changes")
 
-	// Create database connection
-	db, err := sql.Open("postgres", s.config.Database.DSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
 	// Call the stored procedure
-	_, err = db.Exec("CALL recalculate_price_changes()")
+	_, err := s.db.Exec("CALL recalculate_price_changes()")
 	if err != nil {
 		return fmt.Errorf("failed to recalculate price changes: %w", err)
 	}
@@ -827,7 +794,7 @@ func (s *Scraper) ScrapeStockPrices() error {
 		stockDataList = s.CalculatePriceChanges(stockDataList)
 
 		// Save to database
-		err = s.SaveStockData(ticker, stockDataList)
+		err = s.ValidateAndSaveStockData(ticker, stockDataList)
 		if err != nil {
 			s.logger.Error("Failed to save data for %s: %v", ticker, err)
 			continue
@@ -844,4 +811,171 @@ func (s *Scraper) ScrapeStockPrices() error {
 
 	s.logger.Info("Scraping completed successfully")
 	return nil
+}
+
+// 1. First, add a function to get the latest date we have
+func (s *Scraper) getLatestDate(ticker string) (string, error) {
+	var latestDate sql.NullTime
+	err := s.db.QueryRow(`
+		SELECT MAX(date) 
+		FROM daily_stock_prices 
+		WHERE ticker = $1
+	`, ticker).Scan(&latestDate)
+
+	if err != nil {
+		return "", err
+	}
+
+	if !latestDate.Valid {
+		s.logger.Info("No existing data found for ticker %s", ticker)
+		return "2000-01-01", nil // Return a very old date if no data exists
+	}
+
+	formattedDate := latestDate.Time.Format("2006-01-02")
+	s.logger.Info("Latest date in database for %s: %s", ticker, formattedDate)
+	return formattedDate, nil
+}
+
+// 2. Modify the GetStockData function to use overlap detection
+func (s *Scraper) scrapePageData(currentPage int, ticker string) ([]StockData, error) {
+	s.logger.Debug("Starting scrapePageData for ticker: %s, page: %d", ticker, currentPage)
+
+	// Create a new context with a longer timeout (60 seconds instead of 30)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Create new browser context for each scrape
+	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, chromedp.DefaultExecAllocatorOptions[:]...)
+	defer allocCancel()
+
+	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
+	defer browserCancel()
+
+	url := fmt.Sprintf("http://www.isx-iq.net/isxportal/portal/companyprofilecontainer.html?currLanguage=en&companyCode=%s%%20&activeTab=0", ticker)
+
+	// Add more robust error handling and retries for navigation
+	var navigationError error
+	for attempts := 0; attempts < 3; attempts++ {
+		err := chromedp.Run(browserCtx,
+			chromedp.Navigate(url),
+			chromedp.WaitReady("body", chromedp.ByQuery),
+		)
+		if err == nil {
+			navigationError = nil
+			break
+		}
+		navigationError = err
+		time.Sleep(2 * time.Second)
+	}
+
+	if navigationError != nil {
+		return nil, fmt.Errorf("failed to navigate after retries: %v", navigationError)
+	}
+
+	// Add explicit waits and checks for form elements
+	err := chromedp.Run(browserCtx,
+		chromedp.WaitVisible("#fromDate", chromedp.ByID),
+		chromedp.WaitVisible("#command > div.filterbox > div.button-all > input[type=button]", chromedp.ByQuery),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find form elements: %v", err)
+	}
+
+	// Set date and trigger search with better error handling
+	err = chromedp.Run(browserCtx,
+		chromedp.SetValue("#fromDate", "01/01/2020", chromedp.ByID),
+		chromedp.Sleep(1*time.Second),
+		chromedp.Click("#command > div.filterbox > div.button-all > input[type=button]", chromedp.ByQuery),
+		chromedp.Sleep(2*time.Second),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set date and search: %v", err)
+	}
+
+	// Wait for and verify table data
+	var hasData bool
+	err = chromedp.Run(browserCtx,
+		chromedp.WaitVisible("#dispTable", chromedp.ByID),
+		chromedp.Evaluate(`!!document.querySelector("#dispTable tbody tr")`, &hasData),
+	)
+	if err != nil || !hasData {
+		return nil, fmt.Errorf("table data not found or error: %v", err)
+	}
+
+	// Extract data with improved error handling
+	var pageData []StockData
+	err = chromedp.Run(browserCtx,
+		chromedp.Evaluate(`
+			(() => {
+				try {
+					const rows = document.querySelectorAll("#dispTable tbody tr");
+					if (!rows || rows.length === 0) return null;
+					
+					const data = [];
+					for (const row of rows) {
+						const cells = row.querySelectorAll("td");
+						if (cells.length < 10) continue;
+						
+						data.push({
+							Date: cells[9].textContent.trim(),
+							OpenPrice: cells[7].textContent.trim(),
+							HighPrice: cells[6].textContent.trim(),
+							LowPrice: cells[5].textContent.trim(),
+							ClosePrice: cells[8].textContent.trim(),
+							Volume: cells[1].textContent.trim(),
+							TotalShares: cells[2].textContent.trim(),
+							NumTrades: cells[0].textContent.trim()
+						});
+					}
+					return data.length > 0 ? data : null;
+				} catch (e) {
+					console.error("Scraping error:", e);
+					return null;
+				}
+			})()
+		`, &pageData),
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract data: %v", err)
+	}
+
+	if pageData == nil || len(pageData) == 0 {
+		s.logger.Debug("No data found for ticker %s on page %d", ticker, currentPage)
+		return nil, nil
+	}
+
+	s.logger.Debug("Successfully scraped %d records for ticker %s on page %d", len(pageData), ticker, currentPage)
+	return pageData, nil
+}
+
+// Add this helper function
+func (s *Scraper) setDateRangeAndSearch(ctx context.Context) (bool, error) {
+	var success bool
+	err := chromedp.Run(ctx,
+		chromedp.Evaluate(`
+			(() => {
+				try {
+					// Set date range
+					const dateInput = document.querySelector("#fromDate");
+					if (!dateInput) throw new Error("Date input not found");
+					
+					dateInput.value = "01/01/2020";
+					dateInput.dispatchEvent(new Event('change', { bubbles: true }));
+					
+					// Click search button
+					const searchButton = document.querySelector("#command > div.filterbox > div.button-all > input[type=button]");
+					if (!searchButton) throw new Error("Search button not found");
+					
+					searchButton.click();
+					return true;
+				} catch (e) {
+					console.error('Setup error:', e);
+					return false;
+				}
+			})()
+		`, &success),
+	)
+
+	return success, err
 }

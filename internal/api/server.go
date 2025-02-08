@@ -1,13 +1,18 @@
-// Package api provides the HTTP server and API endpoints for the Local Portfolio Manager
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"localportfoliomanager/internal/reporting"
 	"localportfoliomanager/internal/utils"
+	"localportfoliomanager/scraper"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -16,10 +21,12 @@ import (
 // Server represents the API server instance
 // It handles HTTP requests and manages connections to the database
 type Server struct {
-	router *mux.Router   // HTTP request router
-	logger *utils.Logger // Application logger
-	config *utils.Config // Application configuration
-	db     *sql.DB       // Database connection
+	router  *mux.Router      // HTTP request router
+	logger  *utils.AppLogger // Application logger
+	config  *utils.Config    // Application configuration
+	db      *sql.DB          // Database connection
+	scraper *scraper.Scraper
+	ctx     context.Context
 }
 
 // NewServer creates and initializes a new API server instance
@@ -28,134 +35,209 @@ type Server struct {
 // Parameters:
 //   - logger: Application logger for recording server activities
 //   - config: Application configuration including database and server settings
+//   - db: Database connection
+//   - scraper: Scraper instance for stock data scraping
 //
 // Returns:
 //   - *Server: Initialized server instance
 //   - The function will call logger.Fatal if database connection fails
-func NewServer(logger *utils.Logger, config *utils.Config) *Server {
-	// Initialize database connection
-	db, err := sql.Open("postgres", config.Database.DSN)
-	if err != nil {
-		logger.Fatal("Failed to connect to database: %v", err)
-	}
-
+func NewServer(logger *utils.AppLogger, config *utils.Config, db *sql.DB, scraper *scraper.Scraper) *Server {
 	server := &Server{
-		router: mux.NewRouter(),
-		logger: logger,
-		config: config,
-		db:     db,
+		router:  mux.NewRouter(),
+		logger:  logger,
+		config:  config,
+		db:      db,
+		scraper: scraper,
+		ctx:     context.Background(),
 	}
 
-	server.setupRoutes()
+	// Create reporting service and handler
+	reportingService := reporting.NewReportingService(db)
+	reportingHandler := reporting.NewReportingHandler(reportingService)
+
+	server.setupRouter()
+	server.setupRoutes(reportingHandler)
+	server.verifyRoutes()
+	server.startStockUpdater()
 	return server
 }
 
-// setupRoutes configures all API endpoints for the server
-// This includes routes for stocks, portfolios, and transactions
-//
-// API Endpoints:
-// Stock Data:
-//   - GET /api/stocks                     - List all stocks with latest prices
-//   - GET /api/stocks/{ticker}            - Get detailed information for a specific stock
-//   - GET /api/stocks/{ticker}/prices     - Get historical prices for a stock
-//
-// Portfolio Management:
-//   - POST   /api/portfolios             - Create a new portfolio
-//   - GET    /api/portfolios             - List all portfolios
-//   - GET    /api/portfolios/{id}        - Get portfolio details
-//   - PUT    /api/portfolios/{id}        - Update portfolio information
-//   - DELETE /api/portfolios/{id}        - Delete a portfolio
-//   - GET    /api/portfolios/{id}/performance - Get portfolio performance metrics
-//
-// Transaction Management:
-//   - POST   /api/portfolios/{id}/transactions    - Record a new transaction
-//   - GET    /api/portfolios/{id}/transactions    - List portfolio transactions
-//   - GET    /api/portfolios/{id}/transactions/{txId} - Get transaction details
-func (s *Server) setupRoutes() {
-	// Add debug logging
+// setupRoutes configures APIs for the server.
+func (s *Server) setupRoutes(reportingHandler *reporting.ReportingHandler) {
 	s.logger.Debug("Setting up routes...")
 
-	// Add a test/debug endpoint
-	s.router.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
-		routes := []string{}
-		s.router.Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
-			path, _ := route.GetPathTemplate()
-			methods, _ := route.GetMethods()
-			routes = append(routes, fmt.Sprintf("%v %v", methods, path))
-			return nil
-		})
-		s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-			"status": "Server is running",
-			"routes": routes,
-		})
-	}).Methods("GET")
+	// Create API subrouter
+	apiRouter := s.router.PathPrefix("/api").Subrouter()
 
-	// Stock data endpoints
+	// Test endpoint
+	apiRouter.HandleFunc("/test", s.TestConnection).Methods("GET")
+	s.logger.Debug("Registered route: GET /api/test")
+
+	// Create stocks subrouter with better path handling
+	stocksRouter := apiRouter.PathPrefix("/stocks").Subrouter()
+
+	// Define routes with explicit paths
+	routes := []struct {
+		path    string
+		handler http.HandlerFunc
+		methods []string
+	}{
+		{"/latest", s.GetLatestStockPrices, []string{"GET"}},
+		{"/{ticker}/prices", s.GetStockPrices, []string{"GET"}},
+		{"/{ticker}/sparkline", s.GetStockSparkline, []string{"GET"}},
+		{"/{ticker}/chart", s.GetStockChartData, []string{"GET"}},
+		{"/{ticker}", s.GetStockDetails, []string{"GET"}},
+		{"/", s.GetStocks, []string{"GET"}},
+	}
+
+	// Register routes and log them
+	for _, route := range routes {
+		stocksRouter.HandleFunc(route.path, route.handler).Methods(route.methods...)
+		s.logger.Debug("Registered route: %s /api/stocks%s", route.methods[0], route.path)
+	}
+
+	// Portfolio routes
+	portfolioRouter := apiRouter.PathPrefix("/portfolios").Subrouter()
+	portfolioRouter.HandleFunc("", s.ListPortfolios).Methods("GET")
+	portfolioRouter.HandleFunc("", s.CreatePortfolio).Methods("POST")
+	portfolioRouter.HandleFunc("/{id}", s.GetPortfolio).Methods("GET")
+	portfolioRouter.HandleFunc("/{id}", s.DeletePortfolio).Methods("DELETE")
+	portfolioRouter.HandleFunc("/{id}/rename", s.RenamePortfolio).Methods("PUT")
+	portfolioRouter.HandleFunc("/{id}/holdings", s.GetPortfolioHoldings).Methods("GET")
+
+	// Add these transaction routes
+	portfolioRouter.HandleFunc("/{id}/transactions", s.GetTransactions).Methods("GET")
+	portfolioRouter.HandleFunc("/{id}/transactions", s.CreateTransaction).Methods("POST")
+
+	s.logger.Debug("Registered route: GET /api/portfolios/{id}/transactions")
+	s.logger.Debug("Registered route: POST /api/portfolios/{id}/transactions")
+
+	s.logger.Info("Portfolio routes registered")
+
+	// Add CORS middleware
+	s.router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding")
+
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	s.logger.Info("Routes setup completed")
+
+	// Add logging middleware
+	s.router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			s.logger.Debug("Request started: %s %s", r.Method, r.URL.Path)
+			next.ServeHTTP(w, r)
+			s.logger.Debug("Request completed: %s %s (%v)", r.Method, r.URL.Path, time.Since(start))
+		})
+	})
+
+	// Add new routes for FIFO tracking
+	s.router.HandleFunc("/api/portfolios/{id}/lots", s.GetLots).Methods("GET")
+	s.router.HandleFunc("/api/portfolios/{id}/summary", s.GetPortfolioSummary).Methods("GET")
+
+	// Add reporting routes
+	s.router.HandleFunc("/api/portfolios/{id}/performance", reportingHandler.GetPortfolioPerformance).Methods("GET")
+
+	// Stock routes
 	s.router.HandleFunc("/api/stocks", s.GetStocks).Methods("GET")
-	s.router.HandleFunc("/api/stocks/{ticker}", s.GetStockByTicker).Methods("GET")
-	s.router.HandleFunc("/api/stocks/{ticker}/prices", s.GetStockPrices).Methods("GET")
-
-	// Portfolio endpoints
-	s.router.HandleFunc("/api/portfolios", s.CreatePortfolio).Methods("POST")
-	s.router.HandleFunc("/api/portfolios", s.ListPortfolios).Methods("GET")
-	s.router.HandleFunc("/api/portfolios/{id}", s.GetPortfolio).Methods("GET")
-	s.router.HandleFunc("/api/portfolios/{id}", s.UpdatePortfolio).Methods("PUT")
-	s.router.HandleFunc("/api/portfolios/{id}", s.DeletePortfolio).Methods("DELETE")
-	s.router.HandleFunc("/api/portfolios/{id}/performance", s.GetPortfolioPerformance).Methods("GET")
-
-	// Transaction endpoints
-	s.router.HandleFunc("/api/portfolios/{id}/transactions/history", s.GetTransactionHistory).Methods("GET")
-	s.router.HandleFunc("/api/portfolios/{id}/transactions/{txId}", s.GetTransaction).Methods("GET")
-	s.router.HandleFunc("/api/portfolios/{id}/transactions", s.ListTransactions).Methods("GET")
-
-	// New route for getting portfolio balance
-	s.router.HandleFunc("/api/portfolios/{id}/balance", s.GetPortfolioBalance).Methods("GET")
-
-	// Add this to setupRoutes
-	s.router.HandleFunc("/api/test/parse-date", func(w http.ResponseWriter, r *http.Request) {
-		dateStr := r.URL.Query().Get("date")
-		date, err := time.Parse("2006-01-02", dateStr)
-		if err != nil {
-			s.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse date: %v", err))
-			return
-		}
-
-		s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-			"input":     dateStr,
-			"parsed":    date,
-			"formatted": date.Format(time.RFC3339),
-			"type":      fmt.Sprintf("%T", date),
-		})
-	}).Methods("GET")
-
-	// Add reset endpoint
-	s.router.HandleFunc("/api/portfolios/{id}/reset", s.ResetPortfolio).Methods("POST")
-
-	// Add portfolio holdings endpoint
-	s.router.HandleFunc("/api/portfolios/{id}/holdings", s.GetPortfolioHoldings).Methods("GET")
-
-	// Add new routes
-	s.router.HandleFunc("/api/portfolios/{id}/performance", s.GetPortfolioPerformance).Methods("GET")
-
-	// Add daily portfolio values endpoint
-	s.router.HandleFunc("/api/portfolios/{id}/daily-values", s.GetPortfolioDailyValues).Methods("GET")
+	s.router.HandleFunc("/api/stocks/{ticker}/details", s.GetStockDetails).Methods("GET")
+	s.router.HandleFunc("/api/stocks/{ticker}/sparkline", s.GetStockSparkline).Methods("GET")
+	s.router.HandleFunc("/api/stocks/{ticker}/chart", s.GetStockChartData).Methods("GET")
 }
 
-// Start begins listening for HTTP requests on the configured port
-// This is a blocking call that will run until the server is shut down
-//
-// Returns:
-//   - error: Any error that occurs while running the server
-//
-// Example Usage:
-//
-//	server := NewServer(logger, config)
-//	if err := server.Start(); err != nil {
-//	    log.Fatal(err)
-//	}
+// setupRouter configures middleware for the server.
+func (s *Server) setupRouter() {
+	s.router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding")
+
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	})
+}
+
+// Start begins listening for HTTP requests.
 func (s *Server) Start() error {
+	// Initial startup message
 	s.logger.Info("Starting API server on port %s", s.config.Server.Port)
-	return http.ListenAndServe(":"+s.config.Server.Port, s.router)
+
+	// Create HTTP server with proper configuration
+	srv := &http.Server{
+		Addr:         ":" + s.config.Server.Port,
+		Handler:      s.router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Channel for server errors
+	errChan := make(chan error, 1)
+
+	// Start server in a goroutine
+	go func() {
+		s.logger.Info("HTTP server starting on http://localhost:%s", s.config.Server.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			s.logger.Error("HTTP server error: %v", err)
+			errChan <- err
+		}
+	}()
+
+	// Wait a moment for the server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Clear startup message
+	s.logger.Info("===========================================")
+	s.logger.Info("🚀 Server is ready at http://localhost:%s", s.config.Server.Port)
+	s.logger.Info("Available endpoints:")
+	s.logger.Info("  GET /api/test")
+	s.logger.Info("  GET /api/stocks")
+	s.logger.Info("  GET /api/stocks/latest")
+	s.logger.Info("  GET /api/stocks/{ticker}")
+	s.logger.Info("  GET /api/stocks/{ticker}/sparkline")
+	s.logger.Info("===========================================")
+
+	// Wait for interrupt signal
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for either error or interrupt
+	select {
+	case err := <-errChan:
+		return fmt.Errorf("server error: %w", err)
+	case <-stop:
+		s.logger.Info("Shutdown signal received")
+	}
+
+	// Graceful shutdown
+	s.logger.Info("Shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		s.logger.Error("Server shutdown failed: %v", err)
+		return err
+	}
+
+	s.logger.Info("Server stopped gracefully")
+	return nil
 }
 
 // ResetPortfolio resets a portfolio by deleting all transactions associated with it
@@ -199,14 +281,88 @@ func (s *Server) respondWithError(w http.ResponseWriter, code int, message strin
 
 // respondWithJSON sends a JSON response with the specified status code and payload
 func (s *Server) respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	response, err := json.Marshal(payload)
-	if err != nil {
-		s.logger.Error("Failed to marshal JSON response: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	w.Write(response)
+	json.NewEncoder(w).Encode(payload)
+}
+
+// TestConnection handler
+func (s *Server) TestConnection(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("Test connection endpoint hit")
+	s.respondWithJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "Server is running",
+	})
+}
+
+func (s *Server) startStockUpdater() {
+	// Run initial update in background
+	go func() {
+		s.logger.Info("Initial stock update running...")
+		if err := s.scraper.ScrapeStockPrices(); err != nil {
+			s.logger.Error("Initial stock update failed: %v", err)
+		} else {
+			s.logger.Info("Initial stock update completed successfully")
+		}
+	}()
+
+	// Set up hourly updates
+	ticker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				s.logger.Info("Running hourly stock update")
+				if err := s.scraper.ScrapeStockPrices(); err != nil {
+					s.logger.Error("Failed to update stocks: %v", err)
+				} else {
+					s.logger.Info("Hourly stock update completed successfully")
+				}
+			case <-s.ctx.Done():
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (s *Server) verifyRoutes() {
+	s.logger.Debug("Verifying registered routes:")
+	s.router.Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
+		pathTemplate, _ := route.GetPathTemplate()
+		methods, _ := route.GetMethods()
+		s.logger.Debug("Route: %s [%v]", pathTemplate, methods)
+		return nil
+	})
+}
+
+func (s *Server) Routes() {
+	// Portfolio routes
+	s.router.HandleFunc("/api/portfolios/{id}/transactions", s.GetTransactions).Methods("GET")
+	s.router.HandleFunc("/api/portfolios/{id}/transactions", s.CreateTransaction).Methods("POST")
+	s.router.HandleFunc("/api/portfolios/{id}/holdings", s.GetPortfolioHoldings).Methods("GET")
+	s.router.HandleFunc("/api/portfolios/{id}/lots", s.GetLots).Methods("GET")
+	s.router.HandleFunc("/api/portfolios/{id}/summary", s.GetPortfolioSummary).Methods("GET")
+}
+
+// Add if not present
+func (s *Server) Router() http.Handler {
+	return s.router
+}
+
+// validateTicker checks if a ticker is valid (either 'CASH' or exists in tickers table)
+func (s *Server) validateTicker(ticker string, tx *sql.Tx) error {
+	if ticker == "CASH" {
+		return nil
+	}
+
+	var exists bool
+	err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tickers WHERE ticker = $1)`, ticker).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("error checking ticker existence: %v", err)
+	}
+	if !exists {
+		return fmt.Errorf("invalid ticker: %s", ticker)
+	}
+	return nil
 }

@@ -1,0 +1,3 @@
+# Update paths to use new structure
+$logFile = "logs\bbob_trading_test_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+# Rest of the script...

@@ -1,10 +1,37 @@
+# Frontend cache
+frontend/.dart_tool/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+frontend/.metadata
+frontend/.packages
+
+# Log files
+*.log
+
+# Debug files
+debug.*
+*.png
+
+# IDE specific
+.cursor/
+.vscode/
+.idea/
+
+# Build artifacts
+bin/
+pkg/
+
+# Environment files
+.env
+.env.local
+
+# Test artifacts
+coverage/
+
 # Output and temporary files
 output/
 logs/
 temp_builds/
-*.log
-
-# Go specific
 *.exe
 *.exe~
 *.dll
@@ -13,12 +40,6 @@ temp_builds/
 *.test
 *.out
 go.work
-
-# IDE specific
-.idea/
-.vscode/
-*.swp
-*.swo
 
 # OS specific
 .DS_Store
