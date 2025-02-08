@@ -158,6 +158,7 @@ func (s *Server) setupRoutes(reportingHandler *reporting.ReportingHandler) {
 
 // setupRouter configures middleware for the server.
 func (s *Server) setupRouter() {
+	s.router.HandleFunc("/health", s.healthCheck).Methods("GET")
 	s.router.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -365,4 +366,18 @@ func (s *Server) validateTicker(ticker string, tx *sql.Tx) error {
 		return fmt.Errorf("invalid ticker: %s", ticker)
 	}
 	return nil
+}
+
+func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
+	// Check database connection
+	err := s.db.Ping()
+	if err != nil {
+		s.respondWithError(w, http.StatusServiceUnavailable, "Database unavailable")
+		return
+	}
+
+	s.respondWithJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"version": "1.0.0",
+	})
 }
