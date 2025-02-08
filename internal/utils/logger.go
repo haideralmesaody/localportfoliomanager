@@ -1,29 +1,38 @@
 package utils
 
-import "github.com/sirupsen/logrus"
+import (
+	"log"
+	"os"
+)
 
-// Logger wraps logrus.Logger
-type Logger struct {
-	*logrus.Logger
+type Logger interface {
+	Debug(msg string, args ...interface{})
+	Info(msg string, args ...interface{})
+	Error(msg string, args ...interface{})
 }
 
-// Error logs an error message
-func (l *Logger) Error(format string, args ...interface{}) {
-	l.Errorf(format, args...)
+type AppLogger struct {
+	debug *log.Logger
+	info  *log.Logger
+	error *log.Logger
 }
 
-// Info logs an info message
-func (l *Logger) Info(format string, args ...interface{}) {
-	l.Infof(format, args...)
+func NewAppLogger() *AppLogger {
+	return &AppLogger{
+		debug: log.New(os.Stdout, "DEBUG: ", log.Ldate|log.Ltime|log.Lshortfile),
+		info:  log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime),
+		error: log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile),
+	}
 }
 
-// Debug logs a debug message
-func (l *Logger) Debug(format string, args ...interface{}) {
-	l.Debugf(format, args...)
+func (l *AppLogger) Debug(msg string, args ...interface{}) {
+	l.debug.Printf(msg, args...)
 }
 
-func NewLogger() *Logger {
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
-	return &Logger{Logger: logger}
+func (l *AppLogger) Info(msg string, args ...interface{}) {
+	l.info.Printf(msg, args...)
+}
+
+func (l *AppLogger) Error(msg string, args ...interface{}) {
+	l.error.Printf(msg, args...)
 }
